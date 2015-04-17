@@ -61,3 +61,6 @@ target/
 ._.DS_Store
 Thumbs.db
 
+# pycharm projects
+.idea
+
