@@ -408,7 +408,6 @@ def main():
     for in_file_path in args.files :
         input_files.update(search_for_input_files(in_file_path))
     input_files = list(input_files)
-    print("input_files: " + str(input_files))
 
     # try to do the conversion
     return_code = hdf4_2_netcdf4(out_path, input_files)
