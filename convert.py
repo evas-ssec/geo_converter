@@ -9,51 +9,72 @@ Created by evas April 2015.
 Copyright (c) 2015 University of Wisconsin SSEC. All rights reserved.
 """
 
-import os, sys, logging, re
+import os, sys, logging, re, pkg_resources
+from constants import *
 
 # import the appropriate file handling modules
-from netCDF4 import Dataset                     # used to process output netCDF4 files
-from pyhdf.SD import SD,SDC, SDS, HDF4Error     # used to process input hdf4 files
+from netCDF4 import Dataset          # used to process output netCDF4 files
+from pyhdf.SD import SD,SDC, SDS     # used to process input hdf4 files
 
 LOG = logging.getLogger(__name__)
 
-VERSION = 0.1
-
 # TODO, these utility and file processing functions / constants should probably move to other files in the future
-
-OUT_FILE_SUFFIX = ".nc"
-
-LINES_DIM_NAME = "lines"
-ELEMS_DIM_NAME = "elements"
-
-# a list of variables of special dimensions, with their expected shape and dimension names
-SPECIAL_VARIABLES = {
-                        r".*?_planck"            :   [(2, 16),          ("cal_dim_temp1", "channel_num")],
-                        r"calibration_.*?"       :   [(2, 16),          ("cal_dim_temp1", "channel_num")],
-                        r".*?_wavenumber"        :   [(2, 16),          ("cal_dim_temp1", "channel_num")],
-                        r"scan_line_time"        :   [(None,),          (LINES_DIM_NAME,)],
-                        r".*?_quality_flags1"    :   [(None, None, 3),  (LINES_DIM_NAME, ELEMS_DIM_NAME, "qf_depth1")],
-                        r".*?_cloud_mask_packed" :   [(None, None, 7),  (LINES_DIM_NAME, ELEMS_DIM_NAME, "packed_bytes1")],
-                        r".*?_cloud_type_packed" :   [(None, None, 6),  (LINES_DIM_NAME, ELEMS_DIM_NAME, "packed_bytes2")],
-                    }
-
-INPUT_TYPES = ['hdf']
 
 def clean_path(string_path) :
     """
     Return a clean form of the path without things like '.', '..', or '~'
     """
-    clean_path = None
+    path_to_return = None
     if string_path is not None :
-        clean_path = os.path.abspath(os.path.expanduser(string_path))
+        path_to_return = os.path.abspath(os.path.expanduser(string_path))
 
-    return clean_path
+    return path_to_return
 
-GLOBAL_ATTRS_KEY = "global_attributes"
-VAR_LIST_KEY     = "variable_list"
-VAR_INFO_KEY     = "variable_info"
-SHAPE_KEY        = "shape"
-VAR_ATTRS_KEY    = "attributes"
+def setup_dir_if_needed(dirPath, descriptionName) :
+    """
+    create the directory if that is needed, if not don't
+    """
+    if not (os.path.isdir(dirPath)) :
+        LOG.info("Specified " + descriptionName + " directory (" + dirPath + ") does not exist.")
+        LOG.info("Creating " + descriptionName + " directory.")
+        os.makedirs(dirPath)
+
+def search_for_input_files(starting_file_path, input_types=INPUT_TYPES) :
+    """
+    given a list of file paths, search down through any directories
+    and find files that are of the appropriate input types
+    """
+
+    file_paths_to_return = set([ ])
+
+    # make sure the path is fully expanded
+    clean_file_path = clean_path(starting_file_path)
+
+    # if this is a single file, test it to see if it's an acceptable input file
+    if os.path.isfile(clean_file_path) :
+
+        # check that the file is of the correct type
+        file_ext = os.path.splitext(os.path.split(clean_file_path)[-1])[-1][1:]
+        if file_ext in input_types :
+            file_paths_to_return.update(clean_file_path)
+        else :
+            LOG.warn("Input file type (" + file_ext + ") is not the expected input type for this program. "
+                     "File path will not be processed: " + clean_file_path)
+
+    # otherwise, if it's a directory, expand it and test anything we find
+    elif os.path.isdir(clean_file_path) :
+
+        for in_file in os.listdir(clean_file_path) :
+            temp_paths = search_for_input_files(os.path.join(clean_file_path, in_file))
+            file_paths_to_return.update(temp_paths)
+
+    else :
+
+        LOG.warn("Input path is neither an existing file nor a directory. " +
+                 "Path will not be processed: " + starting_file_path)
+
+
+    return file_paths_to_return
 
 def read_hdf4_info(input_file_path) :
     """
@@ -130,40 +151,63 @@ def determine_dimensions (in_file_info) :
     lines_num    = None
     for var_name in in_file_info[VAR_LIST_KEY] :
 
+        # if this is one of our special variables, process it later
         is_special = False
         for special_var_pattern in SPECIAL_VARIABLES.keys() :
             if re.match(special_var_pattern, var_name) :
                 vars_to_process_last.append(var_name)
                 is_special = True
 
-        # if the variable isn't a special case, process it now
+        # if the variable isn't a special case, try to process it now
         if not is_special :
+
             # get the variable shape
             shape_temp = in_file_info[VAR_INFO_KEY][var_name][SHAPE_KEY]
 
             # if it isn't a special var and it's 2 sized, then we expect (lines, elements)
             if len(shape_temp) is 2 :
 
+                # if we don't have an expected number of lines, assume this is it
+                mismatched_lines = False
                 if lines_num is None :
                     lines_num = shape_temp[0]
                     dimensions[LINES_DIM_NAME] = lines_num
                 else :
-                    assert (lines_num == shape_temp[0])
+                    # check if the dim we assume is lines matches the number of lines we have
+                    if lines_num != shape_temp[0] :
+                        LOG.warn("The first dimension of the two dimensional variable " + var_name +
+                                 " does not correspond to the expected number of lines for this data.")
+                        vars_to_process_last.append(var_name)
+                        mismatched_lines = True
 
-                if elements_num is None :
-                    elements_num = shape_temp[1]
-                    dimensions[ELEMS_DIM_NAME] = elements_num
-                else :
-                    assert (elements_num == shape_temp[1])
+                if not mismatched_lines :
 
-                variable_dim_info[var_name] = (LINES_DIM_NAME, ELEMS_DIM_NAME)
+                    # if we don't have an expected number of elements, assume this is it
+                    mismatched_elems = False
+                    if elements_num is None :
+                        elements_num = shape_temp[1]
+                        dimensions[ELEMS_DIM_NAME] = elements_num
+                    else :
+                        # check if the dim we assume is elements matches the number of elements we have
+                        if elements_num != shape_temp[1] :
+                            LOG.warn("The second dimension of the two dimensional variable " + var_name +
+                                     " does not correspond to the expected number of elements for this data.")
+                            vars_to_process_last.append(var_name)
+                            mismatched_elems = True
+
+                    # if the lines and elements match, add the assumed dims to our list of dims
+                    if not mismatched_elems :
+                        variable_dim_info[var_name] = (LINES_DIM_NAME, ELEMS_DIM_NAME)
 
             else :
                 LOG.warn("Unexpected dimensions for variable " + var_name + " of " + str(shape_temp) + ".")
+                vars_to_process_last.append(var_name) # deal with the complex variables later
 
-    # now match up any special variables
+    # now match up any special variables and handle any cases we couldn't classify
+    temp_dim_index_counter = 1
     for var_name in vars_to_process_last :
 
+        # look through the special variables info and see if this variable matches one of them
         expected_dims_size  = None
         expected_dims_names = None
         for special_var_pattern in SPECIAL_VARIABLES.keys() :
@@ -173,8 +217,30 @@ def determine_dimensions (in_file_info) :
                 expected_dims_size  = SPECIAL_VARIABLES[special_var_pattern][0]
                 expected_dims_names = SPECIAL_VARIABLES[special_var_pattern][1]
 
-        # todo, handle the failure case more gently
-        assert (expected_dims_names is not None)
+        # if the variable was not described in the special variables info, make it some temp dim names
+        if expected_dims_names is None :
+
+            LOG.warn("Unable to find information about variable " + var_name + ". " +
+                     "Temporary dimension names will be created for this variable.")
+
+            expected_dims_names = [ ]
+            expected_dims_size  = [ ]
+
+            # get the variable shape
+            shape_temp = in_file_info[VAR_INFO_KEY][var_name][SHAPE_KEY]
+
+            # generate temporary dimensions
+            for temp_index in range(len(shape_temp)) :
+
+                dim_name = TEMP_DIM_NAME + temp_dim_index_counter
+                temp_dim_index_counter += 1
+                dim_size = shape_temp[temp_index]
+
+                expected_dims_names.append(dim_name)
+                expected_dims_size.append(dim_size)
+
+            expected_dims_names = tuple(expected_dims_names)
+            expected_dims_size  = tuple(expected_dims_size)
 
         # process each dimension for this variable
         for temp_index in range(len(expected_dims_names)) :
@@ -191,6 +257,7 @@ def determine_dimensions (in_file_info) :
 
     return dimensions, variable_dim_info
 
+# TODO, set up proper return codes in case there are file access problems
 def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
     """
     given an input file to get raw variable data from, a structure describing the variables and
@@ -227,7 +294,8 @@ def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
         fill_value_temp = variable_attr_info["_FillValue"] if "_FillValue" in variable_attr_info else None
 
         # create the variable with the appropriate dimensions
-        out_var_obj = out_file.createVariable(var_name, data_type, variable_dimensions_info[var_name], fill_value=fill_value_temp)
+        out_var_obj = out_file.createVariable(var_name, data_type, variable_dimensions_info[var_name],
+                                              fill_value=fill_value_temp)
         out_var_obj.set_auto_maskandscale(False)
 
         # set the variable attributes
@@ -240,138 +308,109 @@ def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
 
     return out_file
 
+def hdf4_2_netcdf4(out_path, files_list):
+    """convert Geocat output hdf4 file(s) to netcdf4 file(s)
+    Given a list of files that are output hdf4 files from Geocat,
+    convert them to netcdf4 files and save them in the output directory.
+
+    Note: It is assumed that all the files given in files_list are existing
+    files of the appropriate hdf4 format.
+    """
+
+    # warn the user if no files were given as input
+    if len(files_list) <= 0 :
+        LOG.warn("No files were listed in the command line input. No file processing will be done.")
+
+    # process each file the user wants converted separately
+    for file_path in files_list :
+
+        # check that the output directory and the input directories are not the same
+        # for now just warn the user if they are
+        in_dir  = os.path.split(file_path)[0]
+        in_file_name = os.path.split(file_path)[1]
+        out_dir = clean_path(out_path)
+        if in_dir == out_dir :
+            LOG.warn("Output file will be placed in the same directory used for input: " + in_dir)
+
+        LOG.info("Attempting to convert file: " + file_path)
+
+        # extract file information
+        in_file_info, in_file_object = read_hdf4_info(file_path)
+
+        # TODO, make any changes needed for CF compliance
+
+        # figure out the full path (with name) for the new output file
+        new_file_name = os.path.splitext(in_file_name)[0] + OUT_FILE_SUFFIX
+        new_file_path = os.path.join(out_dir, new_file_name)
+
+        out_file_object = None
+        if os.path.exists(new_file_path) :
+            LOG.warn("Output file already exists, file will not be processed: " + new_file_path)
+        else:
+            # create the output file and write the appropriate data and attributes to the new file
+            out_file_object = write_netCDF4_file (in_file_object, in_file_info, new_file_path)
+
+        # close both the old and new files
+        in_file_object.end()
+        if out_file_object is not None:
+            out_file_object.close()
+
 def main():
     import argparse
-
-    # TODO, the usage is not described the way I would like on the command line, it's missing the list of commands
+    description_text = """
+    Convert Geocat hdf4 output files to the netCDF4 format.
+    """
 
     # create the argument parser
-    parser = argparse.ArgumentParser(description='Manage input for geo_converter.')
-
-    # TODO, the order of the arguments is currently important, can I fix this?
+    parser = argparse.ArgumentParser(description=description_text)
 
     # add arguments to represent user command line options
-    parser.add_argument('command', type=str, nargs=1, default=None,
-                        help='which command you want to execute in the converter')
     parser.add_argument('files', type=str, nargs=argparse.REMAINDER,
-                        help='file or list of files to be processed') # todo, option to load all files from directories
+                        help='file or list of files to be processed')
     parser.add_argument('-o', '--out', dest='out', type=str, default="./",
-                        help='the path to the output directory') # todo, add creation of output directory if it doesn't exist
-    parser.add_argument('-v', '--version', dest='version', action='store_true', default=False,
+                        help='the path to the output directory; will be created if it does not exist')
+    parser.add_argument('-d', '--dirs', dest='do_search_dirs', default=False, action='store_true',
+                        help='search any directories given in the files list for files that can be processed')
+    parser.add_argument('-n', '--version', dest='version', action='store_true', default=False,
                         help='display the version number of the installed version of the program')
 
-    # FUTURE todo, add command line options to handle logging levels and data aggregation
+    # logging related options
+    parser.add_argument('-v', '--verbose', dest='verbosity', action="count", default=0,
+                        help='each occurrence increases verbosity 1 level through ERROR-WARNING-INFO-DEBUG (default ERROR)')
+    parser.add_argument('--debug', dest="debug_mode", default=False, action='store_true',
+                        help="Enter debug mode. Overrides the verbose command line.")
+
+    # FUTURE, add command line options to handle data aggregation
 
     # parse the arguments
     args = parser.parse_args()
 
-    # TODO, set up the appropriate argparse options to configure logging
     # set up the logging level based on the options the user selected on the command line
-    lvl = logging.DEBUG #logging.WARNING
-    #if options.debug: lvl = logging.DEBUG
-    #elif options.verbose: lvl = logging.INFO
-    #elif options.quiet: lvl = logging.ERROR
+    levels = [logging.ERROR, logging.WARN, logging.INFO, logging.DEBUG]
+    lvl = levels[min(3, args.verbosity)]
+    if args.debug_mode : lvl = logging.DEBUG # override if the user specifically asked for debug
     logging.basicConfig(level = lvl)
 
     # display the version
     if args.version :
-        print ("geo_converter version " + str(VERSION) + '\n')
+        version_num = pkg_resources.require('geocat_converter')[0].version
+        print ("geo_converter version " + str(version_num) + '\n')
 
-    commands = {}
-    prior = None
-    prior = dict(locals())
+    # create the output path if it doesn't exist
+    out_path = clean_path(args.out)
+    setup_dir_if_needed(out_path, "output")
 
-    """
-    The following functions represent available command selections.
-    """
+    # process through the input files and search any directories for files we can process
+    # Note: this is a recursive search
+    input_files = set([ ])
+    for in_file_path in args.files :
+        input_files.update(search_for_input_files(in_file_path))
+    input_files = list(input_files)
 
-    def hdf4_2_netcdf4(args):
-        """convert Geocat output hdf4 file(s) to netcdf4 file(s)
-        Given a list of files that are output hdf4 files from Geocat,
-        convert them to netcdf4 files and save them in the output directory.
-        """
+    # try to do the conversion
+    return_code = hdf4_2_netcdf4(out_path, input_files)
 
-        # warn the user if no files were given as input
-        if len(args.files) <= 0 :
-            LOG.warn("No files were listed in the command line input. No file processing will be done.")
-
-        # process each file the user wants converted separately
-        for file_path in args.files :
-
-            # make sure the path is fully expanded
-            clean_file_path = clean_path(file_path)
-
-            # check that the output directory and the input directories are not the same
-            # (or will these be the same sometimes?)
-            in_dir  = os.path.split(clean_file_path)[0]
-            in_file_name = os.path.split(clean_file_path)[1]
-            out_dir = clean_path(args.out)
-            if in_dir == out_dir :
-                LOG.warn("Output file will be placed in the same directory used for input: " + in_dir)
-
-            # check to make sure the file exists
-            if os.path.exists(clean_file_path) :
-
-                # check that the file is of the correct type
-                file_ext = os.path.splitext(os.path.split(clean_file_path)[-1])[-1][1:]
-                if file_ext in INPUT_TYPES :
-
-                    LOG.info("Attempting to convert file: " + clean_file_path)
-
-                    # extract file information
-                    in_file_info, in_file_object = read_hdf4_info(clean_file_path)
-
-                    # TODO, make any changes needed for CF compliance
-
-                    # figure out the full path (with name) for the new output file
-                    new_file_name = os.path.splitext(in_file_name)[0] + OUT_FILE_SUFFIX
-                    new_file_path = os.path.join(out_dir, new_file_name)
-
-                    out_file_object = None
-                    if os.path.exists(new_file_path) :
-                        LOG.warn("Output file already exists, file will not be processed: " + new_file_path)
-                    else:
-                        # create the output file and write the appropriate data and attributes to the new file
-                        out_file_object = write_netCDF4_file (in_file_object, in_file_info, new_file_path)
-
-                    # close both the old and new files
-                    in_file_object.end()
-                    if out_file_object is not None:
-                        out_file_object.close()
-
-                else:
-                    LOG.warn("File type (" + file_ext + ") is not the expected input type for this program. "
-                             "File path will not be converted: " + clean_file_path)
-            else :
-                LOG.warn("Unable to process input because file does not exist. " +
-                         "File path will not be converted: " + clean_file_path)
-
-    def help(command=None):
-        """print help for a specific command or list of commands
-        e.g. help stats
-        """
-        if command is None:
-            # print first line of docstring
-            for cmd in commands:
-                ds = commands[cmd].__doc__.split('\n')[0]
-                print "%-16s %s" % (cmd,ds)
-        else:
-            print commands[command].__doc__
-
-    # all the local public functions are considered part of glance, collect them up
-    commands.update(dict(x for x in locals().items() if x[0] not in prior))
-
-    # if what the user asked for is not one of our existing functions, print the help
-    if (args.command[0] is None) or (args.command[0] not in commands):
-        parser.print_help()
-        help()
-        return 9
-    else:
-        # call the function the user named, given the arguments from the command line
-        rc = locals()[args.command[0]](args)
-        return 0 if rc is None else rc
-
-    return 0 # it shouldn't be possible to get here any longer
+    return 0 if return_code is None else return_code
 
 if __name__=='__main__':
     sys.exit(main())
