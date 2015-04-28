@@ -270,8 +270,8 @@ def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
     """
 
     # make the output file
-    out_file = Dataset(output_path, mode='w', format='NETCDF4')
-
+    out_file = Dataset(output_path, mode='w', format='NETCDF4', clobber=True)
+    
     # figure out what dimensions we expect
     dimensions_info, variable_dimensions_info = determine_dimensions (in_file_info)
     #  create the dimensions in the netCDF file
