@@ -50,13 +50,16 @@ def search_for_input_files(starting_file_path, input_types=INPUT_TYPES) :
     # make sure the path is fully expanded
     clean_file_path = clean_path(starting_file_path)
 
+    LOG.debug("Considering input path: " + clean_file_path)
+
     # if this is a single file, test it to see if it's an acceptable input file
     if os.path.isfile(clean_file_path) :
 
         # check that the file is of the correct type
         file_ext = os.path.splitext(os.path.split(clean_file_path)[-1])[-1][1:]
         if file_ext in input_types :
-            file_paths_to_return.update(clean_file_path)
+            LOG.debug("Path is an existing file of an acceptable type.")
+            file_paths_to_return.update([clean_file_path])
         else :
             LOG.warn("Input file type (" + file_ext + ") is not the expected input type for this program. "
                      "File path will not be processed: " + clean_file_path)
@@ -64,7 +67,9 @@ def search_for_input_files(starting_file_path, input_types=INPUT_TYPES) :
     # otherwise, if it's a directory, expand it and test anything we find
     elif os.path.isdir(clean_file_path) :
 
+        LOG.debug("Path is a directory. Searching inside this directory.")
         for in_file in os.listdir(clean_file_path) :
+
             temp_paths = search_for_input_files(os.path.join(clean_file_path, in_file))
             file_paths_to_return.update(temp_paths)
 
@@ -343,17 +348,14 @@ def hdf4_2_netcdf4(out_path, files_list):
         new_file_name = os.path.splitext(in_file_name)[0] + OUT_FILE_SUFFIX
         new_file_path = os.path.join(out_dir, new_file_name)
 
-        out_file_object = None
         if os.path.exists(new_file_path) :
-            LOG.warn("Output file already exists, file will not be processed: " + new_file_path)
-        else:
-            # create the output file and write the appropriate data and attributes to the new file
-            out_file_object = write_netCDF4_file (in_file_object, in_file_info, new_file_path)
+            LOG.warn("Output file already exists, old version of file will be destroyed: " + new_file_path)
+        # create the output file and write the appropriate data and attributes to the new file
+        out_file_object = write_netCDF4_file (in_file_object, in_file_info, new_file_path)
 
         # close both the old and new files
         in_file_object.end()
-        if out_file_object is not None:
-            out_file_object.close()
+        out_file_object.close()
 
 def main():
     import argparse
@@ -406,6 +408,7 @@ def main():
     for in_file_path in args.files :
         input_files.update(search_for_input_files(in_file_path))
     input_files = list(input_files)
+    print("input_files: " + str(input_files))
 
     # try to do the conversion
     return_code = hdf4_2_netcdf4(out_path, input_files)
