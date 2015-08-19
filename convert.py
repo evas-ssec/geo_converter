@@ -13,12 +13,10 @@ import os, sys, logging, re, pkg_resources
 from constants import *
 
 # import the appropriate file handling modules
-from netCDF4 import Dataset          # used to process output netCDF4 files
-from pyhdf.SD import SD,SDC, SDS     # used to process input hdf4 files
+from netCDF4 import Dataset                  # used to process output netCDF4 files
+from pyhdf.SD import SD, SDC, SDS, HDF4Error # used to process input hdf4 files
 
 LOG = logging.getLogger(__name__)
-
-# TODO, these utility and file processing functions / constants should probably move to other files in the future
 
 def clean_path(string_path) :
     """
@@ -262,7 +260,85 @@ def determine_dimensions (in_file_info) :
 
     return dimensions, variable_dim_info
 
-# TODO, set up proper return codes in case there are file access problems
+def compliance_cleanup (in_file_info) :
+    """
+    given information about the file in the format read in by , clean up the variables and attributes to
+    ensure at least minimal CF compliance
+
+    Note: changes will be made in place, so pass in a copy of your in_file_info if you wish to keep the original info
+    """
+
+    # TODO changes to the global attributes:
+    # TODO, add a timestamp to the global attributes called Image_DateTime
+    # this should be based on the exiting attributes Image_Date and Image_Time (delete those attributes)
+    # and should be in the same format as Production_DateTime (ISO 8601)
+    """ info on the original Image_Date and Image_Time variables' formats
+
+    make a new attribute called Image_Date_Time
+		ISO standard time format for the global attributes?
+		use "Image_Date" (attribute is YYYJJ where YYY is years since 1900)
+		use "Image_Time" (attribute is HHMMSS)
+		(remove the Image_Date and Image_Time from the global attributes)
+		python datetime is probably want we want to use for this conversion
+			it handles leap days but not leap seconds (the time module is the other way around)
+
+	also Graeme says: I would suggest appending "Z" to the timestamp to indicate UTC.
+	"""
+    # TODO, update the Output_Library_version attribute to match the library we are using here
+    # TODO, possibly remove the HDF4_Version attribute? Check with Graeme.
+
+    # TODO, NOTE: in setting this up we need some flexibility by using patterns to identify variable names
+    #             (since most variables append the algorithm name and or version to their name)
+
+    # TODO, delete any variables that we will not be outputing
+    #   TODO, remove scan_line_time variable
+
+    # TODO, for each variable, do some cleanup
+        # TODO, remove any attributes that need to be removed
+        #   TODO, if the variable has scale_factor and add_offset but is not being scaled, remove those attributes
+        #   TODO, if the variable has a scaling_method other than none or simple linear, warn the user
+        #   TODO, if units is "no units" or "none" remove the attribute or change it to "1"
+        #         (use "1" for variables corresponding to "dimensional qualities" (prob most products but not calibration?))
+        #         (Based on context I'm guessing "dimensional qualities" is related to physical corresponding to places
+        #          on the earth, so it probably applies to most of our image data but not our calibration stuff.)
+        # TODO, change any attributes that need to be changed
+        #   TODO, for the things with units of "mWm-2sr-1(cm-1)-1" change it to "mW m-2 sr-1 (cm-1)-1"
+        # TODO, add any attributes that need to be added
+        #   TODO, add long_name where available (include the algorithm in the long name)
+        #   TODO, add standard_name where available
+        #   TODO, add valid_range (valid_min, valid_max, valid_range?) where available
+        #         for packed data these are recorded in the packed domain, calculate as needed based on the fill value
+        #         (if fast, warn the user if data falls outside of the expected range and is not the fill value)
+        #   TODO, add ancillary_variables where available
+        #         "When one data variable provides metadata about the individual values of another data variable
+        #          it may be desirable to express this association by providing a link between the variables.
+        #          For example, instrument data may have associated measures of uncertainty."
+        #   TODO, add flag_values where available for category variables (list of possible valid values of the category)
+        #   TODO, add flag_meanings where available for category variables (list of what the categories mean,
+        #         corresponds to flag_values in order)
+        #   (NOTE: Geoff is going to get back to me with category related information for some of the algorithm output.)
+
+
+
+    # TODO, remap and clean up the channel_index based on Table 11 in the Geocat manual
+    #   probably need to talk to Graeme about how this is going to work
+
+    """ TEMP, notes on the in_file_info format
+
+       {
+            GLOBAL_ATTRS_KEY    : a dictionary of attribute values keyed by the attribute names
+            VAR_LIST_KEY        : [list of variable names]
+            VAR_INFO_KEY        :   {
+                                        <var_name> :    {
+                                                            SHAPE_KEY: (shape of variable data)
+                                                            VAR_ATTRS_KEY: a dictionary of attribute values keyed by
+                                                                           the attribute names
+                                                        }
+                                    }
+
+        }
+    """
+
 def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
     """
     given an input file to get raw variable data from, a structure describing the variables and
@@ -271,7 +347,7 @@ def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
 
     # make the output file
     out_file = Dataset(output_path, mode='w', format='NETCDF4', clobber=True)
-    
+
     # figure out what dimensions we expect
     dimensions_info, variable_dimensions_info = determine_dimensions (in_file_info)
     #  create the dimensions in the netCDF file
@@ -296,7 +372,7 @@ def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
         # get the fill value
         variable_attr_info = in_file_info[VAR_INFO_KEY][var_name][VAR_ATTRS_KEY]
         # TODO, this needs to be case insensitive
-        fill_value_temp = variable_attr_info["_FillValue"] if "_FillValue" in variable_attr_info else None
+        fill_value_temp = variable_attr_info[FILL_VALUE_KEY] if FILL_VALUE_KEY in variable_attr_info else None
 
         # create the variable with the appropriate dimensions
         out_var_obj = out_file.createVariable(var_name, data_type, variable_dimensions_info[var_name],
@@ -305,7 +381,7 @@ def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
 
         # set the variable attributes
         for attr_key in variable_attr_info.keys() :
-            if attr_key != "_FillValue" :
+            if attr_key != FILL_VALUE_KEY :
                 setattr(out_var_obj, attr_key, variable_attr_info[attr_key])
 
         # set the variable data
@@ -322,9 +398,12 @@ def hdf4_2_netcdf4(out_path, files_list):
     files of the appropriate hdf4 format.
     """
 
+    code_to_return = 0
+
     # warn the user if no files were given as input
     if len(files_list) <= 0 :
         LOG.warn("No files were listed in the command line input. No file processing will be done.")
+        code_to_return = 1
 
     # process each file the user wants converted separately
     for file_path in files_list :
@@ -339,10 +418,18 @@ def hdf4_2_netcdf4(out_path, files_list):
 
         LOG.info("Attempting to convert file: " + file_path)
 
-        # extract file information
-        in_file_info, in_file_object = read_hdf4_info(file_path)
+        in_file_object  = None
+        out_file_object = None
+        in_file_info    = None
+        try :
+            # extract file information
+            in_file_info, in_file_object = read_hdf4_info(file_path)
+        except HDF4Error :
+            LOG.warn("Unable to open input file (" + file_path + ") due to HDF4Error.")
+            code_to_return = 2
 
-        # TODO, make any changes needed for CF compliance
+        # make any changes needed for CF compliance
+        in_file_info = compliance_cleanup(in_file_info)
 
         # figure out the full path (with name) for the new output file
         new_file_name = os.path.splitext(in_file_name)[0] + OUT_FILE_SUFFIX
@@ -350,12 +437,22 @@ def hdf4_2_netcdf4(out_path, files_list):
 
         if os.path.exists(new_file_path) :
             LOG.warn("Output file already exists, old version of file will be destroyed: " + new_file_path)
-        # create the output file and write the appropriate data and attributes to the new file
-        out_file_object = write_netCDF4_file (in_file_object, in_file_info, new_file_path)
+            code_to_return = 3
+
+        try :
+            # create the output file and write the appropriate data and attributes to the new file
+            out_file_object = write_netCDF4_file (in_file_object, in_file_info, new_file_path)
+        except Exception :
+            LOG.warn("Unable to create output file (" + new_file_path + ").")
+            code_to_return = 4
 
         # close both the old and new files
-        in_file_object.end()
-        out_file_object.close()
+        if in_file_object  is not None :
+            in_file_object.end()
+        if out_file_object is not None :
+            out_file_object.close()
+
+    return code_to_return
 
 def main():
     import argparse
