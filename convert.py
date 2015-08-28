@@ -10,6 +10,7 @@ Copyright (c) 2015 University of Wisconsin SSEC. All rights reserved.
 """
 
 import os, sys, logging, re, pkg_resources
+from datetime import datetime
 from constants import *
 
 # import the appropriate file handling modules
@@ -261,83 +262,186 @@ def determine_dimensions (in_file_info) :
     return dimensions, variable_dim_info
 
 def compliance_cleanup (in_file_info) :
+    """given information about the file, clean up the variables and attributes to ensure minimal CF compliance
+
+    Changes will be made in place, so pass in a copy of your in_file_info if you wish to keep the original info
+
+    This method is using python's datetime module because it handles leap days correctly (which may matter since
+    we are taking in a julian day format). This module does not handle leap seconds, so this could cause
+    time inaccuracies in the output. (The other option was to use python's time module which handles leap seconds
+    but not leap days. I've opted for the one that is likely to introduce the least inaccuracy in the output if
+    something goes wrong with how leap days and seconds are processed.)
+
+    Details of changes:
+
+    The datetime information in the global attributes Image_Date and Image_Time will be transformed into a
+    single global attribute called "Image_Date_Time" in an ISO standard format https://en.wikipedia.org/wiki/ISO_8601
+
+    The Output_Library_Version attribute will be updated to reflect the netCDF library we are using to write the files.
+
+    Variables in the VARS_TO_DELETE list will be removed.
+
+    For each variable
+
+        the scale factor and add offset will be removed if they are unneeded (ie. the variable isn't scaled)
+
+        if the data is being scaled, the range attributes will be automatically filled in
+
+        if the scaling method is anything other than linear or no scaling, a warning will be issued
+
+        if the variable has no units but this is incorrectly labeled, units will either be removed or set to "1"
+
+        attributes with values on the CONVERT_ATTRS_MAP will be converted to a different value
+
+        where possible, descriptive attributes such as long_name, valid range information, and flag
+        names / meanings will be added to each variable
     """
-    given information about the file in the format read in by , clean up the variables and attributes to
-    ensure at least minimal CF compliance
 
-    Note: changes will be made in place, so pass in a copy of your in_file_info if you wish to keep the original info
-    """
+    ### changes to the global attributes:
 
-    # TODO changes to the global attributes:
-    # TODO, add a timestamp to the global attributes called Image_DateTime
-    # this should be based on the exiting attributes Image_Date and Image_Time (delete those attributes)
-    # and should be in the same format as Production_DateTime (ISO 8601)
-    """ info on the original Image_Date and Image_Time variables' formats
+    # add a timestamp to the global attributes called Image_Date_Time
 
-    make a new attribute called Image_Date_Time
-		ISO standard time format for the global attributes?
-		use "Image_Date" (attribute is YYYJJ where YYY is years since 1900)
-		use "Image_Time" (attribute is HHMMSS)
-		(remove the Image_Date and Image_Time from the global attributes)
-		python datetime is probably want we want to use for this conversion
-			it handles leap days but not leap seconds (the time module is the other way around)
+    # get our input date and time attributes, and then remove them
+    image_date = in_file_info[GLOBAL_ATTRS_KEY][IMAGE_DATE_ATTR_NAME] # attribute is YYYJJ where YYY is years since 1900
+    del in_file_info[GLOBAL_ATTRS_KEY][IMAGE_DATE_ATTR_NAME]
+    image_time = in_file_info[GLOBAL_ATTRS_KEY][IMAGE_TIME_ATTR_NAME] # attribute is HHMMSS
+    del in_file_info[GLOBAL_ATTRS_KEY][IMAGE_TIME_ATTR_NAME]
+    # python's datetime can't handle our input year type, so reformat that into a format it can parse
+    date_format_in_temp = "%Y%j %H%M%S"
+    temp_date_time_str =  str(int(str(image_date)[0:3]) + 1900) + str(image_date)[3:6] + " " + str(image_time)
+    # parse our date time string into a datetime object
+    datetime_obj = datetime.strptime(temp_date_time_str, date_format_in_temp)
+    # save the new date time attribute to the global attributes
+    in_file_info[GLOBAL_ATTRS_KEY][IMAGE_DATETIME_ATTR_NAME] = datetime_obj.strftime(ISO_OUT_TIME_FORMAT)
 
-	also Graeme says: I would suggest appending "Z" to the timestamp to indicate UTC.
-	"""
-    # TODO, update the Output_Library_version attribute to match the library we are using here
-    # TODO, possibly remove the HDF4_Version attribute? Check with Graeme.
+    LOG.debug ("file global date/time: " + in_file_info[GLOBAL_ATTRS_KEY][IMAGE_DATETIME_ATTR_NAME])
 
-    # TODO, NOTE: in setting this up we need some flexibility by using patterns to identify variable names
+    # update the Output_Library_Version attribute to match the output library we are using here
+    in_file_info[GLOBAL_ATTRS_KEY][LIB_VERSION_ATTR_NAME] = str(pkg_resources.get_distribution("netCDF4"))
+
+    ### changes to variables and variable attributes:
+
+    # NOTE: in setting this up we need some flexibility by using patterns to identify variable names
     #             (since most variables append the algorithm name and or version to their name)
 
-    # TODO, delete any variables that we will not be outputing
-    #   TODO, remove scan_line_time variable
+    # delete any variables that we will not be writing out
+    for var_name in VARS_TO_DELETE :
+        if var_name in in_file_info[VAR_INFO_KEY] :
+            del in_file_info[VAR_INFO_KEY][var_name] # remove the variable from our file info
+            in_file_info[VAR_LIST_KEY] = list(in_file_info[VAR_INFO_KEY].keys()) # rebuild the variable list
+            # FUTURE, we may want to match variables by pattern rather than by raw name
 
-    # TODO, for each variable, do some cleanup
-        # TODO, remove any attributes that need to be removed
-        #   TODO, if the variable has scale_factor and add_offset but is not being scaled, remove those attributes
-        #   TODO, if the variable has a scaling_method other than none or simple linear, warn the user
-        #   TODO, if units is "no units" or "none" remove the attribute or change it to "1"
+    # for each variable, do some cleanup
+    for var_name in in_file_info[VAR_INFO_KEY].keys() :
+
+        # hang on to a link to the variable info dictionary
+        var_info = in_file_info[VAR_INFO_KEY][var_name]
+
+        ### remove, add, and change attributes as needed
+
+        # check the scaling and remove the scaling attributes if this variable is not being scaled
+        scale_factor = var_info[VAR_ATTRS_KEY]["scale_factor"] if "scale_factor" in var_info[VAR_ATTRS_KEY] else None
+        add_offset   = var_info[VAR_ATTRS_KEY]["add_offset"]   if "add_offset"   in var_info[VAR_ATTRS_KEY] else None
+        did_set_ranges = False
+        if scale_factor == 1.0 and add_offset == 0.0 :
+            LOG.debug("Scaling attributes indicate no scaling for " + var_name
+                      + ". Unneeded scaling attributes will be removed for this variable.")
+            del var_info[VAR_ATTRS_KEY]["scale_factor"]
+            del var_info[VAR_ATTRS_KEY]["add_offset"]
+            del var_info[VAR_ATTRS_KEY]["scaling_method"]
+        elif scale_factor is not None and add_offset is not None:
+            # need to set up the range/min/max related attributes
+            #         for packed data these are recorded in the packed domain, calculate as needed based on the fill value
+            #         (if fast, warn the user if data falls outside of the expected range and is not the fill value)
+            temp_range = SHORT_RANGE_DEFAULT[:]
+            fill_value = var_info[VAR_ATTRS_KEY][FILL_VALUE_KEY]
+            if fill_value <= 0 :
+                temp_range[0] = fill_value + 1
+            else :
+                temp_range[1] = fill_value - 1
+            LOG.debug("Setting valid range attributes for packed variable " + var_name + " to range " + str(temp_range) + ".")
+            # set valid_range, valid_min, and valid_max attributes
+            var_info[VAR_ATTRS_KEY][VALID_RANGE_ATTR_NAME] = temp_range
+            var_info[VAR_ATTRS_KEY][VALID_MIN_ATTR_NAME]   = temp_range[0]
+            var_info[VAR_ATTRS_KEY][VALID_MAX_ATTR_NAME]   = temp_range[1]
+            # remember that we already did this
+            did_set_ranges = True
+
+        # if the variable has a scaling_method other than none or simple linear, warn the user
+        scaling_method = var_info[VAR_ATTRS_KEY]["scaling_method"] if "scaling_method" in var_info[VAR_ATTRS_KEY] else None
+        if scaling_method is not None and (scaling_method != 1 and scaling_method != 0) :
+            LOG.warn("A scaling method of " + str(scaling_method) + " was found for variable " + var_name + ". "
+                     + "This does not match expected methods that correspond to no scaling or linear scaling. "
+                     + "Methods described by the Geocat manual include: 0=no scaling, 1=linear, 2=logarithm, 3=square root. "
+                     + "Existing NetCDF software may not scale this data properly from the output NetCDF file.")
+
+        # if units is "no units" or "none" remove the attribute or change it to "1"
         #         (use "1" for variables corresponding to "dimensional qualities" (prob most products but not calibration?))
         #         (Based on context I'm guessing "dimensional qualities" is related to physical corresponding to places
         #          on the earth, so it probably applies to most of our image data but not our calibration stuff.)
-        # TODO, change any attributes that need to be changed
-        #   TODO, for the things with units of "mWm-2sr-1(cm-1)-1" change it to "mW m-2 sr-1 (cm-1)-1"
-        # TODO, add any attributes that need to be added
-        #   TODO, add long_name where available (include the algorithm in the long name)
-        #   TODO, add standard_name where available
-        #   TODO, add valid_range (valid_min, valid_max, valid_range?) where available
-        #         for packed data these are recorded in the packed domain, calculate as needed based on the fill value
-        #         (if fast, warn the user if data falls outside of the expected range and is not the fill value)
-        #   TODO, add ancillary_variables where available
+        units_temp = var_info[VAR_ATTRS_KEY]["units"] if "units" in var_info[VAR_ATTRS_KEY] else None
+        if units_temp in BAD_UNITS_SET :
+            # for the moment, assume that if data has two or more dimensions it is "dimensional"
+            if "shape" in var_info and len(var_info["shape"]) >= 2 :
+                LOG.debug("Changing units from " + units_temp + " to 1 for variable " + var_name + ".")
+                var_info[VAR_ATTRS_KEY]["units"] = "1"
+            else :
+                LOG.debug("Removing empty units attribute from variable " + var_name + ".")
+                del var_info[VAR_ATTRS_KEY]["units"]
+
+        # check to see if any of the attributes falls in our simple conversion list
+        for attr_name in var_info[VAR_ATTRS_KEY].keys() :
+            attr_val = var_info[VAR_ATTRS_KEY][attr_name]
+            if attr_val in CONVERT_ATTRS_MAP.keys() :
+                LOG.debug("Changing variable attribute " + attr_name + " for variable "
+                          + var_name + " from " + attr_val + " to " + CONVERT_ATTRS_MAP[attr_val] + ".")
+                var_info[VAR_ATTRS_KEY][attr_name] = CONVERT_ATTRS_MAP[attr_val]
+
+        ### if this variable needs descriptive attributes added, add those
+
+        # add long_name where available (FUTURE, include the algorithm in the long name)
+        for var_exp_key in LONG_NAME_MAP.keys() :
+            temp_match = re.match(var_exp_key, var_name)
+            if temp_match is not None :
+                long_name_str = None
+                if var_exp_key in CHANNEL_DATA_PATTERNS :
+                    long_name_str = LONG_NAME_MAP[var_exp_key] % (temp_match.group(2), temp_match.group(1))
+                else :
+                    long_name_str = LONG_NAME_MAP[var_exp_key]
+                var_info[VAR_ATTRS_KEY][LONG_NAME_ATTR_NAME] = long_name_str
+                LOG.debug("Adding long name to " + var_name + ": " + long_name_str)
+
+        # add information about the range of the data
+        for var_exp_key in RANGE_LIMS_MAP.keys() :
+            temp_match = re.match(var_exp_key, var_name)
+            if temp_match is not None and not did_set_ranges :
+                temp_range = RANGE_LIMS_MAP[var_exp_key]
+                # set valid_range, valid_min, and valid_max attributes
+                LOG.debug("Setting valid range attributes for variable " + var_name + " to range " + str(temp_range) + ".")
+                var_info[VAR_ATTRS_KEY][VALID_RANGE_ATTR_NAME] = temp_range
+                var_info[VAR_ATTRS_KEY][VALID_MIN_ATTR_NAME]   = temp_range[0]
+                var_info[VAR_ATTRS_KEY][VALID_MAX_ATTR_NAME]   = temp_range[1]
+
+        # add information about flag (category variable) values and their meanings
+        for var_exp_key in FLAG_INFO_MAP.keys() :
+            # add flag_values where available (list of possible valid values of the category)
+            # add flag_meanings where available (list of what the categories mean; corresponds to flag_values in order)
+            temp_match = re.match(var_exp_key, var_name)
+            if temp_match is not None and not did_set_ranges :
+                var_info[VAR_ATTRS_KEY][FLAG_VALS_ATTR_NAME]     = FLAG_INFO_MAP[var_exp_key][FLAG_VALS_ATTR_NAME]
+                var_info[VAR_ATTRS_KEY][FLAG_MEANINGS_ATTR_NAME] = FLAG_INFO_MAP[var_exp_key][FLAG_MEANINGS_ATTR_NAME]
+
+        # FUTURE, add standard_name where appropriate
+
+        # FUTURE, add ancillary_variables where available
         #         "When one data variable provides metadata about the individual values of another data variable
         #          it may be desirable to express this association by providing a link between the variables.
         #          For example, instrument data may have associated measures of uncertainty."
-        #   TODO, add flag_values where available for category variables (list of possible valid values of the category)
-        #   TODO, add flag_meanings where available for category variables (list of what the categories mean,
-        #         corresponds to flag_values in order)
-        #   (NOTE: Geoff is going to get back to me with category related information for some of the algorithm output.)
-
-
 
     # TODO, remap and clean up the channel_index based on Table 11 in the Geocat manual
-    #   probably need to talk to Graeme about how this is going to work
-
-    """ TEMP, notes on the in_file_info format
-
-       {
-            GLOBAL_ATTRS_KEY    : a dictionary of attribute values keyed by the attribute names
-            VAR_LIST_KEY        : [list of variable names]
-            VAR_INFO_KEY        :   {
-                                        <var_name> :    {
-                                                            SHAPE_KEY: (shape of variable data)
-                                                            VAR_ATTRS_KEY: a dictionary of attribute values keyed by
-                                                                           the attribute names
-                                                        }
-                                    }
-
-        }
-    """
+    #   (this should only affect the calibration variables)
+    #   because this changes variable sizes and their data, this will need to be done when dimensions are
+    #   calculated and when the data is being transferred over to the other file
 
 def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
     """
@@ -350,7 +454,7 @@ def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
 
     # figure out what dimensions we expect
     dimensions_info, variable_dimensions_info = determine_dimensions (in_file_info)
-    #  create the dimensions in the netCDF file
+    # create the dimensions in the netCDF file
     for dim_name in dimensions_info.keys() :
 
         out_file.createDimension(dim_name, dimensions_info[dim_name])
@@ -371,7 +475,7 @@ def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
 
         # get the fill value
         variable_attr_info = in_file_info[VAR_INFO_KEY][var_name][VAR_ATTRS_KEY]
-        # TODO, this needs to be case insensitive
+        # FUTURE, theoretically this needs to be case insensitive, in practice will this cause problems?
         fill_value_temp = variable_attr_info[FILL_VALUE_KEY] if FILL_VALUE_KEY in variable_attr_info else None
 
         # create the variable with the appropriate dimensions
@@ -429,7 +533,7 @@ def hdf4_2_netcdf4(out_path, files_list):
             code_to_return = 2
 
         # make any changes needed for CF compliance
-        in_file_info = compliance_cleanup(in_file_info)
+        compliance_cleanup(in_file_info)
 
         # figure out the full path (with name) for the new output file
         new_file_name = os.path.splitext(in_file_name)[0] + OUT_FILE_SUFFIX
@@ -484,9 +588,11 @@ def main():
     # parse the arguments
     args = parser.parse_args()
 
+    LOG.debug("Running converter with args: " + str(args))
+
     # set up the logging level based on the options the user selected on the command line
     levels = [logging.ERROR, logging.WARN, logging.INFO, logging.DEBUG]
-    lvl = levels[min(3, args.verbosity)]
+    lvl = levels[min(max(0, args.verbosity), 3)]
     if args.debug_mode : lvl = logging.DEBUG # override if the user specifically asked for debug
     logging.basicConfig(level = lvl)
 
