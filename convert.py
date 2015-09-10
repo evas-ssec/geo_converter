@@ -461,7 +461,7 @@ def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
 
     # put the global attributes in the file
     global_attrs_temp = in_file_info[GLOBAL_ATTRS_KEY]
-    for attr_key in global_attrs_temp.keys() :
+    for attr_key in sorted(global_attrs_temp.keys()) :
         setattr(out_file, attr_key, global_attrs_temp[attr_key])
 
     # put each of the variables in the file
@@ -484,7 +484,7 @@ def write_netCDF4_file (in_file_obj, in_file_info, output_path) :
         out_var_obj.set_auto_maskandscale(False)
 
         # set the variable attributes
-        for attr_key in variable_attr_info.keys() :
+        for attr_key in sorted(variable_attr_info.keys()) :
             if attr_key != FILL_VALUE_KEY :
                 setattr(out_var_obj, attr_key, variable_attr_info[attr_key])
 

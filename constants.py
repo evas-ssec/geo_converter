@@ -133,8 +133,8 @@ FLAG_INFO_MAP            = \
             "(.+?)_cloud_phase":
                             {
                                 # from Geoff's quicklooks code
-                                FLAG_VALS_ATTR_NAME:     [0,1,2,3],
-                                FLAG_MEANINGS_ATTR_NAME: "confident_clear probably_clear probably_cloudy confident_cloudy",
+                                FLAG_VALS_ATTR_NAME:     [0,1,2,3,4,5],
+                                FLAG_MEANINGS_ATTR_NAME: "clear water supercooled mixed ice unknown",
                             },
             "(.+?)_cloud_type":
                             {
