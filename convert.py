@@ -308,7 +308,8 @@ def compliance_cleanup (in_file_info) :
     del in_file_info[GLOBAL_ATTRS_KEY][IMAGE_TIME_ATTR_NAME]
     # python's datetime can't handle our input year type, so reformat that into a format it can parse
     date_format_in_temp = "%Y%j %H%M%S"
-    temp_date_time_str =  str(int(str(image_date)[0:3]) + 1900) + str(image_date)[3:6] + " " + str(image_time)
+    temp_date_time_str = str(int(str(image_date)[0:3]) + 1900) + str(image_date)[3:6] + " " + str(image_time).zfill(6)
+    #temp_date_time_str =  str(int(str(image_date)[0:3]) + 1900) + str(image_date)[3:6] + " " + str(image_time)
     # parse our date time string into a datetime object
     datetime_obj = datetime.strptime(temp_date_time_str, date_format_in_temp)
     # save the new date time attribute to the global attributes
